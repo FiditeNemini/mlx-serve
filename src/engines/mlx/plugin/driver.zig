@@ -486,6 +486,11 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     }
     if (ctx.capture_hidden_all) |target| _ = mlx.mlx_array_set(target, hidden);
     if (!head) {
+        // An `.ok` that wrote no hidden rows is a plugin that serves none: fail here, not as an empty array downstream.
+        if (hidden.ctx == null) {
+            log.err("[plugin] {s}: forward returned no hidden rows\n", .{b.table.name.slice()});
+            return error.PluginForwardUnsupported;
+        }
         var h = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&h, hidden);
         return h;

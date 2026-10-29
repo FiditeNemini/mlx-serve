@@ -1326,3 +1326,12 @@ write-through and, another day, in `HotPrefixCache.deinit`. Cause: the commit pi
 arrays or filed rows under another prompt. Fix: the target crosses the refresh by id (`indexOfId`); an evicted target is
 a fresh store. Guard: the two `across an SSD-first refresh that evicts` tests, each in both orders.
 
+
+### An embeddings request killed a DeepSeek-V4.1 server
+Defect: `POST /v1/embeddings` against a loaded DeepSeek-V4.1 logged `[mlx] expected a non-empty mlx_array` twice, then
+segfaulted the server. Cause: the embedding forward asks the plugin for hidden rows only (`want_hidden`, no logits);
+DeepSeek-V4/V4.1's `forward` ignored the flag, ran a position-0 prompt pass that reset the live conversation state,
+returned `.ok` with no hidden rows, and the driver handed the empty array to the pooling. Fix: both plugins refuse
+`want_hidden` before any forward; the driver fails a hidden-only forward that returns none; the embeddings handler
+refuses a module-owned-state model (`Caps.owns_decode_state`) with a named 400. Guard: `tests/test_dsv41.sh` [7a]
+(refused by name, the next greedy request byte-equal to solo, no `[mlx]` line).
