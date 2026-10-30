@@ -6,8 +6,9 @@
 Keys, transposes and the quantization scope follow mlx-audio (Blaizzy/mlx-audio#1087, `Model.sanitize`): only `llm.*`
 linears, the embedding and the head are quantized; the perception encoders stay bf16, Mamba dynamics, the router and its
 correction bias stay f32. The routed experts' `fc2` reads 1856 columns, which no 128-wide group divides, so it takes
-`--fc2-group-size` (a per-path entry in the config's `quantization`). MTP and the CTC timestamp heads are dropped.
-Needs mlx. An existing output dir is refused.
+`--fc2-group-size` (a per-path entry in the config's `quantization`), the MTP block's included. The MTP head
+(`llm.mtp.*`) quantizes like the trunk; the CTC timestamp head (`ctc_timestamp.*`) keeps NVIDIA's names, layouts and f32,
+with its SentencePiece blob; `alignment_tokenizer/` rides along. Needs mlx. An existing output dir is refused.
 """
 
 import argparse
@@ -18,15 +19,19 @@ from pathlib import Path
 
 import mlx.core as mx
 
+SIDE_DIRS = ["alignment_tokenizer"]
 SIDE_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "processor_config.json", "generation_config.json"]
 KEEP_F32 = (".A_log", ".D", ".dt_bias", ".e_score_correction_bias", ".gate.weight")
+KEEP_RAW = "ctc_timestamp."  # f32 weights, the SentencePiece blob and the integer scalars stay as NVIDIA wrote them
 SHARD_BYTES = 4 << 30
 
 
 def sanitize(key, value):
     """mlx-audio's key map; None drops the tensor."""
-    if key.startswith(("llm.mtp.", "ctc_timestamp.")) or key.endswith("._extra_state"):
+    if key.endswith("._extra_state"):
         return None
+    if key.startswith(KEEP_RAW):
+        return key, value
     for old, new in (
         ("llm.model.embed_tokens.", "llm.backbone.embeddings."),
         ("llm.model.norm.", "llm.backbone.norm_f."),
@@ -98,6 +103,9 @@ def main():
         if got is None:
             continue
         key, value = got
+        if key.startswith(KEEP_RAW):
+            put(key, value)
+            continue
         if key.startswith("llm.") and key.endswith(".gate.weight"):
             value = value.astype(mx.float32)
         elif value.dtype == mx.float32 and not key.endswith(KEEP_F32):
@@ -119,6 +127,9 @@ def main():
     if not args.bf16:
         config["quantization"] = {"group_size": args.group_size, "bits": args.bits, "mode": "affine", **overrides}
     (args.out / "config.json").write_text(json.dumps(config, indent=2))
+    for name in SIDE_DIRS:
+        if (args.source / name).is_dir():
+            shutil.copytree(args.source / name, args.out / name)
     for name in SIDE_FILES:
         if (args.source / name).exists():
             shutil.copy2(args.source / name, args.out / name)
