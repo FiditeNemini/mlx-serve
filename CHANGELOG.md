@@ -9,6 +9,7 @@
 - **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
 - **DeepSeek-V4.1-Flash reads long prompts faster.** Prompts are read 8,192 tokens at a time where memory allows, and the attention, expert and Engram work behind each chunk is faster on M5 Macs.
 - **An embeddings request no longer crashes a DeepSeek server.** Asking DeepSeek-V4 or V4.1 for embeddings now returns a clear error instead of stopping the server.
+- **Outside plugins can use the server's layer blocks.** The plugin kit ships `kit.blocks` (norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the linear, quantized-matmul, MLP, RoPE, attention, MoE, hyper-connection and GDN blocks), versioned with the kit, and `kit.foreign` to register a weight layout of your own, so a plugin calls them instead of rewriting the layer.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
