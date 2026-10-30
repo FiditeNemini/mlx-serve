@@ -52,8 +52,10 @@ Defect: Claude Code's runtime reminders arrive as late system messages; folding 
 all RAM/SSD prefix reuse every tool round. Cause: unconditional folding, because strict templates reject late system
 turns. Fix: parsers merge only the leading run; the renderer probes each late-system boundary with the request's tools
 and kwargs (`templatePreservesMidSystem`) and folds only where the template raises, drops or reorders; byte-pinned
-Qwen revisions render later ChatML system turns. Guard: `mid-system:` tests, the corpus late-note invariant,
-`tests/test_mid_system_cache.sh`.
+Qwen revisions render later ChatML system turns; a folding template logs one warning (`lateFoldWarningId`), since a
+Qwen-derived template outside the pinned revisions lost reuse every tool round with nothing in the log. Guard:
+`mid-system:` tests, the corpus late-note invariant, `tests/test_mid_system_cache.sh`,
+`tests/test_late_system_fold_warning.sh`.
 
 ### A transcribed template's whitespace is a token-level contract (DeepSeek-V4)
 Defect: our transcription of the DSV4 encoder emitted `<bos>## Tools` where the model was trained on `<bos>\n\n##

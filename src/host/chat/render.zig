@@ -4,6 +4,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const jinja_c = @import("jinja_c");
 const log = @import("../../sdk/util/log.zig");
+const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const testing = std.testing;
 
 const ToolCall = @import("types.zig").ToolCall;
@@ -133,6 +134,9 @@ pub fn renderChatTemplate(
         var prepared = std.ArrayList(Message).empty;
         try prepared.appendSlice(a, effective_messages);
         const preserve = try templatePreservesMidSystem(a, effective_messages, chat_config, effective_tools_json, extra_json, empty_content);
+        if (!preserve) if (lateFoldWarningId(tpl)) |id| {
+            log.warn("chat template {x:0>16} cannot keep a late system message in place; it is folded into the leading system prompt, so each new note changes the prompt head and prefix reuse stops there (render a non-first system turn in place to keep it)\n", .{id});
+        };
         _ = try foldSystemMessages(a, &prepared, preserve);
         effective_messages = prepared.items;
     }
@@ -171,6 +175,23 @@ pub fn renderChatTemplate(
         return std.mem.concat(allocator, u8, &.{ base, partial });
     }
     return base;
+}
+
+var late_fold_warned: [32]u64 = undefined;
+var late_fold_warned_len: usize = 0;
+var late_fold_mu: os_mutex.Mutex = .{};
+
+/// The template's id the first time it is seen here, else null: the late-system
+/// fold warns once per template (and stops once the table is full).
+fn lateFoldWarningId(tpl: []const u8) ?u64 {
+    const id = std.hash.Wyhash.hash(0, tpl);
+    late_fold_mu.lock();
+    defer late_fold_mu.unlock();
+    for (late_fold_warned[0..late_fold_warned_len]) |seen| if (seen == id) return null;
+    if (late_fold_warned_len == late_fold_warned.len) return null;
+    late_fold_warned[late_fold_warned_len] = id;
+    late_fold_warned_len += 1;
+    return id;
 }
 
 pub fn hasExtraSystemMessages(messages: []const Message) bool {
@@ -2069,6 +2090,33 @@ test "mid-system: unsupported templates fold without generic fallback or lost no
         const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
         defer allocator.free(rendered);
         try testing.expectEqualStrings("system:stable\n\ninitial hook\n\nlate note;user:question;", rendered);
+    }
+}
+
+test "mid-system: only a template that folds a late note claims its one warning" {
+    const a = testing.allocator;
+    const strict = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}";
+    const leading_only = try std.mem.concat(a, u8, &.{ strict, "{# leading only #}" });
+    defer a.free(leading_only);
+    const qwen = @embedFile("../../fixtures/qwen38_chat_template.jinja");
+    const late = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    const leading = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "system", .content = "hook" },
+        .{ .role = "user", .content = "question" },
+    };
+    for ([_]struct { tpl: []const u8, msgs: []const Message, folds: bool }{
+        .{ .tpl = strict, .msgs = &late, .folds = true },
+        .{ .tpl = leading_only, .msgs = &leading, .folds = false },
+        .{ .tpl = qwen, .msgs = &late, .folds = false },
+    }) |case| {
+        const config = ChatConfig{ .chat_template = case.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        for (0..2) |_| a.free(try renderChatTemplate(a, case.msgs, &config, null, null, false, null, false));
+        try testing.expectEqual(!case.folds, lateFoldWarningId(case.tpl) != null);
     }
 }
 
