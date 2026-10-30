@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Model Browser: five sections (`ModelBrowserSection`), switched by the bar
+/// Model Browser: six sections (`ModelBrowserSection`), switched by the bar
 /// across the top of the content area.
 struct ModelBrowserPane: View {
     /// Which section is showing. The pane's own bar drives it: the sidebar is
@@ -84,13 +84,14 @@ struct ModelBrowserPane: View {
         case .myModels:     MyModelsPane(filter: $localFilter)
         case .downloads:    DownloadsPane(items: activeDownloads)
         case .media:        MediaPane()
+        case .plugins:      PluginsPane()
         }
     }
 }
 
 // MARK: - Section bar
 
-/// The browser's five sections, across the top of the content area.
+/// The browser's six sections, across the top of the content area.
 private struct ModelBrowserSectionBar: View {
     @Binding var section: ModelBrowserSection
     let badges: ModelBrowserBadgeCounts

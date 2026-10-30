@@ -6,6 +6,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const json = @import("../../sdk/config/json.zig");
 const nh = @import("../nemotron_h/config.zig");
+const ctc_align = @import("ctc_align.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "nemotron_transcribe",
@@ -14,7 +15,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{},
 };
 
-pub const model_types = [_][]const u8{"nemo_speechlm"};
+/// NVIDIA's name and mlx-audio's: both write the same tensor names.
+pub const model_types = [_][]const u8{ "nemo_speechlm", "nemotron_transcribe" };
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -62,6 +64,18 @@ pub const Streaming = struct {
     min_positive_rate: f32 = 0.5,
 };
 
+/// The CTC timestamp head (`ctc_timestamps.decoder_config`): the ASR rows upsampled `upsample` x by a learned
+/// transposed convolution, a Transformer bridge scaled by `residual` and added back, a pointwise projection onto
+/// `classes` tokens plus the blank (the last column).
+pub const Ctc = struct {
+    enc: Encoder,
+    /// NVIDIA's aligner constants, the checkpoint's `ctc_timestamps.alignment_config` where it names them.
+    timing: ctc_align.Params = .{},
+    classes: u32,
+    upsample: u32,
+    residual: f32,
+};
+
 pub const Audio = struct {
     rate: u32,
     mels: u32,
@@ -79,6 +93,8 @@ pub const Audio = struct {
     asr: Encoder,
     spk: Encoder,
     stream: Streaming,
+    /// Null when the pack has no head or one the port does not read.
+    ctc: ?Ctc = null,
 };
 
 const Error = error{ Invalid, Unsupported };
@@ -116,6 +132,43 @@ fn encoder(o: json.Object) Error!Encoder {
     };
     if (e.d_model == 0 or e.heads == 0 or e.d_model % e.heads != 0 or e.layers == 0) return error.Invalid;
     return e;
+}
+
+/// The CTC head as the config states it; null for a head the port does not run.
+fn parseCtc(root: json.Object, asr_width: u32) ?Ctc {
+    const d = json.object(json.field(json.object(json.field(root, "ctc_timestamps")) orelse return null, "decoder_config")) orelse return null;
+    const ok = (json.boolean(json.field(d, "use_transformer")) orelse false) and (json.boolean(json.field(d, "residual")) orelse false);
+    if (!ok or (json.boolean(json.field(d, "learnable_residual_scale")) orelse false)) return null;
+    expectString(d, "upsampling_mode", "conv_transpose") catch return null;
+    const width = uint(d, "feat_in", 0) catch return null;
+    const heads = uint(d, "n_heads", 0) catch return null;
+    const layers = uint(d, "n_layers", 0) catch return null;
+    const upsample = uint(d, "upsampling_factor", 1) catch return null;
+    const classes = uint(d, "num_classes", 0) catch return null;
+    if (width != asr_width or heads == 0 or width % heads != 0 or layers == 0 or upsample == 0 or classes == 0) return null;
+    const e: Encoder = .{
+        .d_model = width,
+        .heads = heads,
+        .layers = layers,
+        .ff = @intFromFloat(@as(f64, @floatFromInt(width)) * (num(d, "ff_expansion", 4) catch return null)),
+        .qk_norm = json.boolean(json.field(d, "qk_norm")) orelse false,
+        .rope_base = @floatCast(num(d, "rope_base", 10000) catch return null),
+        .rotary_fraction = @floatCast(num(d, "rotary_fraction", 1) catch return null),
+    };
+    expectString(d, "self_attention_model", "rope") catch return null;
+    expectString(d, "attn_mode", "full") catch return null;
+    if (json.boolean(json.field(d, "qkv_bias")) orelse false) return null;
+    if (json.boolean(json.field(d, "xscaling")) orelse false) return null;
+    if (!(json.boolean(json.field(d, "pre_block_norm")) orelse true)) return null;
+    var params: ctc_align.Params = .{ .max_word_frames = 12 * upsample };
+    if (json.object(json.field(json.object(json.field(root, "ctc_timestamps")).?, "alignment_config"))) |ac| if (json.object(json.field(ac, "parameters"))) |ps| {
+        params.speaker_logprob_weight = @floatCast(num(ps, "speaker_logprob_weight", params.speaker_logprob_weight) catch return null);
+        params.speaker_activity_threshold = @floatCast(num(ps, "speaker_activity_threshold", params.speaker_activity_threshold) catch return null);
+        params.support_threshold = @floatCast(num(ps, "support_activity_threshold", params.support_threshold) catch return null);
+        params.maximum_token_len = num(ps, "maximum_token_len", params.maximum_token_len) catch return null;
+        params.max_word_frames = (uint(ps, "max_word_frames", params.max_word_frames / upsample) catch return null) * upsample;
+    };
+    return .{ .enc = e, .timing = params, .classes = classes, .upsample = upsample, .residual = @floatCast(num(d, "residual_scale", 1) catch return null) };
 }
 
 /// The perception module as the checkpoint's own config states it (`perception`, `pe_encoder_config`).
@@ -157,7 +210,7 @@ pub fn parseAudio(root: json.Object) Error!Audio {
     st.weak_boost_rate = @floatCast(try num(sm, "weak_boost_rate", st.weak_boost_rate));
     st.min_positive_rate = @floatCast(try num(sm, "min_pos_scores_rate", st.min_positive_rate));
 
-    const a: Audio = .{
+    var a: Audio = .{
         .rate = rate,
         .mels = try uint(pre, "features", 128),
         .n_fft = try uint(pre, "n_fft", 512),
@@ -174,6 +227,7 @@ pub fn parseAudio(root: json.Object) Error!Audio {
         .spk = try encoder(spk),
         .stream = st,
     };
+    a.ctc = parseCtc(root, a.asr.d_model);
     if (a.stack == 0 or a.stack != (try uint(spk, "subsampling_factor", 8)) or a.hop == 0 or a.win > a.n_fft or a.speakers == 0 or
         a.out_dim == 0 or st.chunk == 0 or st.cache < (1 + st.silence_per_speaker) * a.speakers)
         return error.Invalid;
@@ -189,13 +243,13 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     const audio = parseAudio(root) catch |e| return refuse(out, if (e == error.Unsupported) .unsupported else .failed, "the perception config");
     if (audio.rate != SAMPLE_RATE or audio.hop != HOP or audio.stack != STACK) return refuse(out, .unsupported, "a sample rate, hop or stacking factor other than 16 kHz / 160 / 8");
     if (audio.out_dim != out.shell.hidden_size) return refuse(out, .failed, "the perception output is not the trunk's width");
-    const id = json.int(json.field(root, "audio_token_id")) orelse return refuse(out, .failed, "no audio_token_id");
+    // mlx-audio's config drops `audio_token_id` and keeps the locator tag: `<|audio|>` is the id past the table.
+    const id: u32 = json.int(json.field(root, "audio_token_id")) orelse
+        (if (json.string(json.field(root, "audio_locator_tag")) != null) out.shell.vocab_size else return refuse(out, .failed, "no audio_token_id"));
     if (out.shell.vocab_size < 2 or id == spliceId(out.shell.vocab_size)) return refuse(out, .failed, "no room for the splice stand-in id");
     out.caps.audio = true;
     out.placeholder_ids.audio = id;
     out.weights.prefix = abi.Str.of("llm.backbone");
-    // The speech wrapper carries no MTP sidecar and runs no drafter.
-    out.spec = .{};
     return .ok;
 }
 
@@ -217,6 +271,10 @@ pub const sample_json =
     \\  "layers_block_type":["mamba","moe","attention","moe"],"n_routed_experts":128,"num_experts_per_tok":6,
     \\  "moe_intermediate_size":1856,"moe_shared_expert_intermediate_size":3712,"routed_scaling_factor":2.5,
     \\  "layer_norm_epsilon":1e-5,"time_step_limit":[0.0,{"__float__":"Infinity"}]},
+    \\ "ctc_timestamps":{"decoder_config":{"feat_in":1280,"num_classes":23862,"use_transformer":true,"n_heads":16,"n_layers":2,
+    \\  "qk_norm":true,"ff_expansion":0.5,"pre_block_norm":true,"self_attention_model":"rope","rope_base":10000.0,
+    \\  "rotary_fraction":0.5,"attn_mode":"full","residual":true,"residual_scale":0.1,"upsampling_factor":2,
+    \\  "upsampling_mode":"conv_transpose"}},
     \\ "perception":{"output_dim":2688,"preprocessor":{"sample_rate":16000,"normalize":null,"window_size":0.025,
     \\  "window_stride":0.01,"window":"hann","features":128,"n_fft":512,"log":true,"frame_splicing":1}},
     \\ "pe_encoder_config":{"asr_encoder_type":"transformer","asr_normalize_type":"per_feature",
@@ -246,6 +304,18 @@ test "nemotron_transcribe config: the NeMo trunk parses through nemotron_h, audi
     try testing.expectEqualStrings("llm.backbone", p.weights.prefix.slice());
 }
 
+test "nemotron_transcribe config: mlx-audio's config names no audio id, its locator tag puts `<|audio|>` past the table" {
+    const mem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = sample_json }} };
+    const dir = mem.packDir();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const theirs = try std.mem.replaceOwned(u8, arena.allocator(), sample_json, "\"audio_token_id\":131072", "\"audio_locator_tag\":\"<|audio|>\",\"nothing\":0");
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(theirs), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(@as(u32, 131072), p.placeholder_ids.audio);
+}
+
 test "nemotron_transcribe config: the splice stand-in is an id inside the table, never the audio id" {
     try testing.expectEqual(@as(u32, 999), spliceId(131072));
     try testing.expectEqual(@as(u32, 63), spliceId(64));
@@ -270,6 +340,18 @@ test "nemotron_transcribe config: the perception geometry and the streaming defa
     try testing.expectEqual(@as(u32, 5120), a.asr.ff);
     try testing.expectEqual(@as(u32, 188), a.stream.cache);
     try testing.expectEqual(@as(u32, 8), a.speakers);
+    const ctc = a.ctc.?;
+    try testing.expectEqual(@as(u32, 640), ctc.enc.ff);
+    try testing.expectEqual(@as(u32, 23862), ctc.classes);
+    try testing.expectEqual(@as(u32, 2), ctc.upsample);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), ctc.residual, 1e-6);
+}
+
+test "nemotron_transcribe config: a head the port does not run leaves the pack without timestamps, not refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bad = try std.mem.replaceOwned(u8, arena.allocator(), sample_json, "\"conv_transpose\"", "\"nearest\"");
+    try testing.expect((try parseAudio(try json.parseRoot(arena.allocator(), bad))).ctc == null);
 }
 
 test "nemotron_transcribe config: a speaker feature mode or an encoder the port lacks is refused by name" {

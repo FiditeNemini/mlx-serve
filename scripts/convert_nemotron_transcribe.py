@@ -8,7 +8,7 @@ linears, the embedding and the head are quantized; the perception encoders stay 
 correction bias stay f32. The routed experts' `fc2` reads 1856 columns, which no 128-wide group divides, so it takes
 `--fc2-group-size` (a per-path entry in the config's `quantization`), the MTP block's included. The MTP head
 (`llm.mtp.*`) quantizes like the trunk; the CTC timestamp head (`ctc_timestamp.*`) keeps NVIDIA's names, layouts and f32,
-with its SentencePiece blob; `alignment_tokenizer/` rides along. Needs mlx. An existing output dir is refused.
+with its SentencePiece blob (the transformer's `ffn.net.*` renamed as the encoders'); `alignment_tokenizer/` rides along. Needs mlx. An existing output dir is refused.
 """
 
 import argparse
@@ -30,8 +30,6 @@ def sanitize(key, value):
     """mlx-audio's key map; None drops the tensor."""
     if key.endswith("._extra_state"):
         return None
-    if key.startswith(KEEP_RAW):
-        return key, value
     for old, new in (
         ("llm.model.embed_tokens.", "llm.backbone.embeddings."),
         ("llm.model.norm.", "llm.backbone.norm_f."),
@@ -42,6 +40,8 @@ def sanitize(key, value):
         (".preprocessor.featurizer.", ".preprocessor."),
     ):
         key = key.replace(old, new)
+    if key.startswith(KEEP_RAW):
+        return key, value
     if key.endswith(".experts.gate_and_up_projs"):
         key, value = key.replace(".experts.gate_and_up_projs", ".switch_mlp.fc1.weight"), value.transpose(0, 2, 1)
     elif key.endswith(".experts.down_projs"):

@@ -8,6 +8,7 @@ const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const reader = @import("../../sdk/bases/reader.zig");
+const quant_abi = @import("../../abi/quant.zig");
 const json = @import("../../sdk/config/json.zig");
 const nh = @import("../nemotron_h/plugin.zig");
 pub const config = @import("config.zig");
@@ -27,10 +28,63 @@ pub const table = blk: {
     t.load = &load;
     t.unload = &unload;
     t.forward = &forward;
-    t.spec = null;
-    t.media = &.{ .tower = &tower, .prepare = &prepare };
+    t.spec = &spec_hooks;
+    t.media = &.{ .tower = &tower, .prepare = &prepare, .word_times = &wordTimes, .diarize = &diarize };
     break :blk t;
 };
+
+// The trunk's MTP head (`nemotron_h`'s, read from `llm.mtp.*` in this pack) and its table for drafters, on the trunk
+// the wrapper holds: each hook gets the wrapper's pointer, never nemotron_h's.
+const trunk_spec = nh.table.spec.?;
+const trunk_head = trunk_spec.head.?;
+
+const head_hooks: abi.HeadHooks = blk: {
+    var h = trunk_head.*;
+    h.load = &headLoad;
+    h.activate = &headActivate;
+    h.release = &headRelease;
+    h.forward = &headForward;
+    h.truncate = &headTruncate;
+    h.adopt = &headAdopt;
+    h.mark = &headMark;
+    h.draft_select = &headSelect;
+    break :blk h;
+};
+
+const spec_hooks: abi.SpecHooks = .{ .head = &head_hooks, .trunk_weight = &trunkWeight };
+
+fn trunkOf(mp: *anyopaque) *anyopaque {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return m.trunk;
+}
+
+fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
+    return trunk_spec.trunk_weight.?(trunkOf(mp), which, out);
+}
+fn headLoad(mp: *anyopaque, ctx: *const abi.LoadCtx) callconv(.c) Verdict {
+    return trunk_head.load(trunkOf(mp), ctx);
+}
+fn headActivate(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
+    return trunk_head.activate(trunkOf(mp), slot);
+}
+fn headRelease(mp: *anyopaque, slot: u32) callconv(.c) void {
+    trunk_head.release(trunkOf(mp), slot);
+}
+fn headForward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    return trunk_head.forward(trunkOf(mp), f, out);
+}
+fn headTruncate(mp: *anyopaque, slot: u32, len: u64) callconv(.c) void {
+    trunk_head.truncate(trunkOf(mp), slot, len);
+}
+fn headAdopt(mp: *anyopaque, slot: u32, snap: abi.Handle) callconv(.c) Verdict {
+    return trunk_head.adopt(trunkOf(mp), slot, snap);
+}
+fn headMark(mp: *anyopaque, slot: u32) callconv(.c) void {
+    trunk_head.mark(trunkOf(mp), slot);
+}
+fn headSelect(mp: *anyopaque, logits: abi.Array, out: *abi.Array) callconv(.c) Verdict {
+    return trunk_head.draft_select(trunkOf(mp), logits, out);
+}
 
 pub const Loaded = struct {
     trunk: *nh.Loaded,
@@ -40,6 +94,9 @@ pub const Loaded = struct {
     /// The in-table id the trunk gathers in their place (`config.spliceId`) and the splice matches.
     splice_id: u32,
     owned: reader.Owned = .{},
+    /// The last `word_times` / `diarize` answer, held until the next call or the unload.
+    ms: []u32 = &.{},
+    frames: []f32 = &.{},
 };
 
 const CONFIG_CAP = 4 << 20;
@@ -76,6 +133,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Loaded = @ptrCast(@alignCast(mp));
+    gpa.free(m.ms);
+    gpa.free(m.frames);
     m.tower.deinit();
     m.owned.deinit();
     nh.table.unload(m.trunk);
@@ -112,6 +171,28 @@ fn oom() Verdict {
     return Verdict.refuse(.failed, "nemotron_transcribe: the prompt ids could not be rewritten");
 }
 
+fn wordTimes(mp: *anyopaque, pcm: abi.Span(f32), units: abi.Span(abi.Str), activity: abi.Span(f32), speakers: u32, out: *abi.Span(u32)) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const words = gpa.alloc([]const u8, units.len) catch return oom();
+    defer gpa.free(words);
+    for (units.slice(), words) |u, *w| w.* = u.slice();
+    const ms = m.tower.wordTimes(pcm.slice(), words, activity.slice(), speakers) catch |e| return Verdict.named(.failed, @errorName(e));
+    gpa.free(m.ms);
+    m.ms = ms;
+    out.* = .of(ms);
+    return .ok;
+}
+
+fn diarize(mp: *anyopaque, pcm: abi.Span(f32), speakers: *u32, out: *abi.Span(f32)) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const frames = m.tower.speakerFrames(pcm.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    gpa.free(m.frames);
+    m.frames = frames;
+    speakers.* = m.tower.cfg.speakers;
+    out.* = .of(frames);
+    return .ok;
+}
+
 /// The clip's samples as the tower reads them (`pixels`, f32 mono 16 kHz); `rows` its encoder rows.
 fn prepare(_: *const abi.Parsed, in: *const abi.MediaInput, _: u64, out: *abi.MediaItem) callconv(.c) Verdict {
     if (in.kind != .audio) return Verdict.refuse(.unsupported, "nemotron_transcribe: audio only");
@@ -139,6 +220,9 @@ fn tower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callconv(.
     return .ok;
 }
 
+/// The tiny CTC head's non-blank classes.
+pub const CTC_CLASSES = 12;
+
 /// The tiny pack the conformance suite runs: nemotron_h's tiny trunk under `llm.`, a one-layer encoder per expert.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     const d = 32; // the ASR expert's width
@@ -156,8 +240,13 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try t.fill("perception.encoder.asr_norm.bias", .{}, &.{d}, .F32, 0);
     try t.fill("perception.encoder.diar_norm.weight", .{}, &.{8}, .F32, 1);
     try t.fill("perception.encoder.diar_norm.bias", .{}, &.{8}, .F32, 0);
-    try encoderTensors(&t, "perception.encoder.asr_encoder", d, 2, mels * 8, true);
-    try encoderTensors(&t, "perception.encoder.diarization_model.encoder", sd, 2, mels * 8, false);
+    try encoderTensors(&t, "perception.encoder.asr_encoder", d, 2 * d, mels * 8, true);
+    try encoderTensors(&t, "perception.encoder.diarization_model.encoder", sd, 2 * sd, mels * 8, false);
+    try encoderTensors(&t, "ctc_timestamp.decoder.transformer", d, d / 2, 0, true);
+    try t.rand("ctc_timestamp.decoder.upsample.weight", .{}, &.{ d, d, 2 }, .F32, 0.2);
+    try t.rand("ctc_timestamp.decoder.upsample.bias", .{}, &.{d}, .F32, 0.1);
+    try t.rand("ctc_timestamp.decoder.decoder_layers.0.weight", .{}, &.{ CTC_CLASSES + 1, d, 1 }, .F32, 0.3);
+    try t.rand("ctc_timestamp.decoder.decoder_layers.0.bias", .{}, &.{CTC_CLASSES + 1}, .F32, 0.1);
     const sm = "perception.encoder.diarization_model.sortformer_modules";
     try t.rand(sm ++ ".encoder_proj.weight", .{}, &.{ tf, sd }, .F32, 0.2);
     try t.rand(sm ++ ".encoder_proj.bias", .{}, &.{tf}, .F32, 0.1);
@@ -170,6 +259,9 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try t.rand(sm ++ ".learnable_sil_emb", .{}, &.{sd}, .F32, 0.1);
     const cfg = try std.fmt.allocPrint(a,
         \\{{"model_type":"nemo_speechlm","audio_token_id":64,"eos_token_id":[2],"llm_config":{s},
+        \\ "ctc_timestamps":{{"decoder_config":{{"feat_in":{d},"num_classes":{d},"use_transformer":true,"n_heads":2,"n_layers":1,
+        \\  "qk_norm":true,"ff_expansion":0.5,"rotary_fraction":0.5,"residual":true,"residual_scale":0.1,"upsampling_factor":2,
+        \\  "upsampling_mode":"conv_transpose"}}}},
         \\ "perception":{{"output_dim":64,"preprocessor":{{"sample_rate":16000,"normalize":null,"window_size":0.0015,
         \\  "window_stride":0.01,"window":"hann","features":16,"n_fft":32,"log":true,"frame_splicing":1}}}},
         \\ "pe_encoder_config":{{"asr_normalize_type":"per_feature","speaker_feature_config_version":1,
@@ -179,7 +271,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
         \\   "rotary_fraction":0.5}},
         \\  "diarization_model_cfg":{{"high_resolution":true,"sortformer_modules":{{"num_spks":8}},
         \\   "encoder":{{"d_model":{d},"n_heads":2,"n_layers":1,"ff_expansion":2,"subsampling_factor":8}}}}}}}}
-    , .{ nh.fixture_trunk_json, d, sd });
+    , .{ nh.fixture_trunk_json, d, CTC_CLASSES, d, sd });
     return .{ .files = try a.dupe(sdk.fixture.File, &.{
         .{ .name = "config.json", .bytes = cfg },
         .{ .name = "model.safetensors", .bytes = try t.bytes() },
@@ -187,9 +279,9 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 }
 
 /// One tiny feature-stacking encoder under `base`.
-fn encoderTensors(t: *sdk.tensors.Tensors, comptime base: []const u8, d: u64, ff_ratio: u64, stack_in: u64, qk_norm: bool) !void {
+fn encoderTensors(t: *sdk.tensors.Tensors, comptime base: []const u8, d: u64, ff: u64, stack_in: u64, qk_norm: bool) !void {
     const hd = d / 2;
-    try t.rand(base ++ ".pre_encode.proj.weight", .{}, &.{ d, stack_in }, .F32, 0.05);
+    if (stack_in > 0) try t.rand(base ++ ".pre_encode.proj.weight", .{}, &.{ d, stack_in }, .F32, 0.05);
     try t.fill(base ++ ".embed_norm.weight", .{}, &.{d}, .F32, 1);
     try t.fill(base ++ ".embed_norm.bias", .{}, &.{d}, .F32, 0);
     try t.fill(base ++ ".final_norm.weight", .{}, &.{d}, .F32, 1);
@@ -207,9 +299,9 @@ fn encoderTensors(t: *sdk.tensors.Tensors, comptime base: []const u8, d: u64, ff
         try t.fill(base ++ ".layers.0.attn.k_norm.weight", .{}, &.{hd}, .F32, 1);
         try t.fill(base ++ ".layers.0.attn.k_norm.bias", .{}, &.{hd}, .F32, 0);
     }
-    try t.rand(base ++ ".layers.0.ffn.linear1.weight", .{}, &.{ d * ff_ratio, d }, .F32, 0.1);
-    try t.rand(base ++ ".layers.0.ffn.linear1.bias", .{}, &.{d * ff_ratio}, .F32, 0.05);
-    try t.rand(base ++ ".layers.0.ffn.linear2.weight", .{}, &.{ d, d * ff_ratio }, .F32, 0.1);
+    try t.rand(base ++ ".layers.0.ffn.linear1.weight", .{}, &.{ ff, d }, .F32, 0.1);
+    try t.rand(base ++ ".layers.0.ffn.linear1.bias", .{}, &.{ff}, .F32, 0.05);
+    try t.rand(base ++ ".layers.0.ffn.linear2.weight", .{}, &.{ d, ff }, .F32, 0.1);
     try t.rand(base ++ ".layers.0.ffn.linear2.bias", .{}, &.{d}, .F32, 0.05);
 }
 
@@ -218,4 +310,5 @@ fn encoderTensors(t: *sdk.tensors.Tensors, comptime base: []const u8, d: u64, ff
 test {
     _ = config;
     _ = perception;
+    _ = @import("ctc_align.zig");
 }

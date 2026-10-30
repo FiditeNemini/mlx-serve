@@ -171,6 +171,72 @@ test "nemotron_transcribe proof: a clip under one hop, or another rate, is refus
     try testing.expect(!hooks.prepare(&pack.parsed, &.{ .kind = .image }, 1 << 30, &item).isOk());
 }
 
+test "nemotron_transcribe proof: the speaker expert alone gives a probability per speaker for every 10 ms frame" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var pack = try open(arena.allocator());
+    defer pack.close();
+    const pcm = try clip(a, 4.0);
+    defer a.free(pcm);
+    const hooks = plugin.table.media.?;
+    var speakers: u32 = 0;
+    var out: abi.Span(f32) = .{};
+    try testing.expect(hooks.diarize.?(pack.model, .of(pcm), &speakers, &out).isOk());
+    try testing.expectEqual(@as(u32, 8), speakers);
+    // 4 s = 400 mel frames, past the 6-row windows, the FIFO and the cache.
+    try testing.expectEqual(@as(usize, 400 * 8), out.slice().len);
+    for (out.slice()) |x| try testing.expect(x >= 0 and x <= 1);
+    // A second call replaces the first answer (plugin-owned), and the same clip hears the same speakers.
+    const first = try a.dupe(f32, out.slice());
+    defer a.free(first);
+    try testing.expect(hooks.diarize.?(pack.model, .of(pcm), &speakers, &out).isOk());
+    try testing.expectEqualSlices(f32, first, out.slice());
+}
+
+test "nemotron_transcribe proof: the CTC head times each word inside the clip, in order, and names who speaks" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var pack = try open(arena.allocator());
+    defer pack.close();
+    const loaded: *plugin.Loaded = @ptrCast(@alignCast(pack.model));
+    const pcm = try clip(a, 4.0);
+    defer a.free(pcm);
+    // Words of 2, 1, 3 and 1 tokens in two turns (the tiny head reads 12 classes).
+    var w0 = [_]u32{ 3, 5 };
+    var w1 = [_]u32{5};
+    var w2 = [_]u32{ 1, 7, 2 };
+    var w3 = [_]u32{9};
+    const words = [_]perception.Tower.TokenWord{ .{ .tag = 0, .ids = &w0 }, .{ .tag = 0, .ids = &w1 }, .{ .tag = 1, .ids = &w2 }, .{ .tag = 1, .ids = &w3 } };
+
+    // Without speaker activity: one pass over every frame, no speaker named.
+    const plain = try loaded.tower.alignTokens(pcm, &words, &.{}, 0);
+    defer std.heap.c_allocator.free(plain);
+    try testing.expectEqual(@as(usize, 4), plain.len);
+    // Each speaker's words come in order (the turns are searched apart, over the same frames).
+    for (plain, 0..) |x, i| {
+        try testing.expect(x.end >= x.start and x.end <= 4.0 + 1.6);
+        try testing.expectEqual(@as(i32, -1), x.speaker);
+        if (i % 2 == 1) try testing.expect(x.start >= plain[i - 1].start);
+    }
+
+    // With the clip's activity, each turn is named for a column.
+    const hooks = plugin.table.media.?;
+    var speakers: u32 = 0;
+    var act: abi.Span(f32) = .{};
+    try testing.expect(hooks.diarize.?(pack.model, .of(pcm), &speakers, &act).isOk());
+    const timed = try loaded.tower.alignTokens(pcm, &words, act.slice(), speakers);
+    defer std.heap.c_allocator.free(timed);
+    try testing.expectEqual(@as(usize, 4), timed.len);
+    try testing.expectEqual(timed[0].speaker, timed[1].speaker);
+    try testing.expectEqual(timed[2].speaker, timed[3].speaker);
+
+    try testing.expectError(error.TokenOutOfRange, loaded.tower.alignTokens(pcm, &.{.{ .tag = -1, .ids = @constCast(&[_]u32{99}) }}, &.{}, 0));
+    // No alignment tokenizer in the tiny pack: words are refused by name, not guessed.
+    try testing.expectError(error.NoAlignmentTokenizer, loaded.tower.wordTimes(pcm, &.{"hello"}, &.{}, 0));
+}
+
 test {
     _ = perception;
 }

@@ -108,7 +108,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     if (dsv41) log.info("chat: deepseek_v41 — using the embedded V4.1 transcription\n", .{});
     // Nemotron Transcribe's own template repeats a list (`["<|audio|>"] * n`), which jinja.cpp cannot run; a failed render
     // drops to the generic format, which carries no audio placeholder.
-    const nemo_speech = dirModelTypeIs(io, allocator, model_dir, "nemo_speechlm");
+    const nemo_speech = dirModelTypeIs(io, allocator, model_dir, "nemo_speechlm") or dirModelTypeIs(io, allocator, model_dir, "nemotron_transcribe");
     const chat_template: []const u8 = if (dsv41)
         try allocator.dupe(u8, @embedFile("../../fixtures/dsv41_chat_template.jinja"))
     else if (nemo_speech)

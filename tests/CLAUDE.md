@@ -150,7 +150,8 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_vision_chunked_prefill.sh` · `test_vision_prefix_cache.sh` · `test_multi_image_history.sh` · `test_decode_end_media_reuse.sh`
 - `test_embeddings.sh` /v1/embeddings · `test_transcriptions.sh` ASR + aligner + diarization
 - `test_lfm3.sh` **E** LFM3 text/VL/Audio/Omni: tools, images, speech out (chat audio, stream, TTS, ASR round trip)
-- `test_nemotron_transcribe.sh` **E** Nemotron 3.5 Transcribe: transcription, long clip, chat `input_audio`, translation, speaker tags
+- `test_nemotron_transcribe.sh` **E** Nemotron 3.5 Transcribe: transcription, long clip, chat `input_audio`, translation, speaker tags, word times, `diarized_json` turn boundaries
+- `dump_ctc_align_fixtures.py` NVIDIA's aligner on seeded scenarios → `src/plugins/nemotron_transcribe/fixtures/ctc_align.json` (user-run; needs a NeMo Speech checkout, numpy, scipy, torch)
 
 **Media generation**
 - `test_unified_gen.sh` load/gen/unload · `test_gen_chat_interleave.sh` chat during media · `test_gen_chat_mix.sh` release battery

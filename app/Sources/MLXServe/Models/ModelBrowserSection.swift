@@ -15,6 +15,8 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     case downloads
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
+    /// Outside plugins: the catalog, installed ones with their switches, and agent install instructions.
+    case plugins
 
     var id: String { rawValue }
 
@@ -25,6 +27,7 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .myModels:     return "My Models"
         case .downloads:    return "Downloads"
         case .media:        return "Media"
+        case .plugins:      return "Plugins"
         }
     }
 
@@ -35,6 +38,7 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .myModels:     return "internaldrive"
         case .downloads:    return "arrow.down.circle"
         case .media:        return "photo.on.rectangle.angled"
+        case .plugins:      return "puzzlepiece.extension"
         }
     }
 
@@ -85,6 +89,7 @@ struct ModelBrowserBadgeCounts: Equatable {
         case .myModels:     n = myModels
         case .downloads:    n = activeDownloads
         case .media:        n = mediaReady
+        case .plugins:      return nil
         }
         return n > 0 ? "\(n)" : nil
     }

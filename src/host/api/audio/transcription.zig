@@ -325,8 +325,11 @@ pub fn buildPrompt(a: std.mem.Allocator, context: ?[]const u8, language: ?[]cons
 }
 
 /// Nemotron 3.5 Transcribe's user-turn instruction: the card's verbatim recipe (its `processor_config.json` default)
-/// with the language named when the client forced one, or its contextual recipe over the client's context terms.
-pub fn nemoPrompt(a: std.mem.Allocator, context: ?[]const u8, language: ?[]const u8) ![]u8 {
+/// with the language named when the client forced one, or its contextual recipe over the client's context terms; for a
+/// speaker-attributed transcript (`speakers`) the card's "who said what" recipe, whose `<spk:N>` turn tags the word
+/// alignment reads.
+pub fn nemoPrompt(a: std.mem.Allocator, context: ?[]const u8, language: ?[]const u8, speakers: bool) ![]u8 {
+    if (speakers) return a.dupe(u8, "Transcribe this audio with punctuation and capitalization. Include all spoken words and verbal fillers. Write numbers in their standard written form. Put speaker tags <spk:0> <spk:1> <spk:2> <spk:3> on the transcription.");
     if (context) |c| return std.fmt.allocPrint(a, "Transcribe with punctuation and capitalization. Context terms: {s}.", .{std.mem.trimEnd(u8, c, ". ")});
     return std.fmt.allocPrint(a, "Audio transcription. Language: {s}. Wording: verbatim, including fillers and repetitions. Formatting: punctuation and capitalization. Output: transcript only.", .{language orelse "as spoken"});
 }
@@ -431,15 +434,18 @@ test "parseForm refuses by name what it cannot honour" {
 
 test "nemoPrompt is the card's verbatim recipe, with a forced language or context terms" {
     const a = testing.allocator;
-    const plain = try nemoPrompt(a, null, null);
+    const plain = try nemoPrompt(a, null, null, false);
     defer a.free(plain);
     try testing.expectEqualStrings("Audio transcription. Language: as spoken. Wording: verbatim, including fillers and repetitions. Formatting: punctuation and capitalization. Output: transcript only.", plain);
-    const german = try nemoPrompt(a, null, "German");
+    const german = try nemoPrompt(a, null, "German", false);
     defer a.free(german);
     try testing.expect(std.mem.startsWith(u8, german, "Audio transcription. Language: German. Wording:"));
-    const terms = try nemoPrompt(a, "Neywa Labs, Nemotron", null);
+    const terms = try nemoPrompt(a, "Neywa Labs, Nemotron", null, false);
     defer a.free(terms);
     try testing.expectEqualStrings("Transcribe with punctuation and capitalization. Context terms: Neywa Labs, Nemotron.", terms);
+    const who = try nemoPrompt(a, null, "German", true);
+    defer a.free(who);
+    try testing.expect(std.mem.endsWith(u8, who, "Put speaker tags <spk:0> <spk:1> <spk:2> <spk:3> on the transcription."));
 }
 
 test "languageName takes ISO codes and names in any case" {
